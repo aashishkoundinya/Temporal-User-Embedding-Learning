@@ -458,6 +458,178 @@ def prepare_movielens_for_gnn(file_path="ml-1m/ratings.dat", time_windows=3):
     
     return graph_data_list
 
+def cluster_users(model, graph_data_list, n_clusters=5):
+    """Cluster users based on their final embeddings"""
+    from sklearn.cluster import KMeans
+    
+    # Get final time window
+    final_graph = graph_data_list[-1]
+    x = final_graph.x
+    edge_index = final_graph.edge_index
+    
+    # Extract user embeddings
+    user_embeddings = []
+    user_ids = []
+    
+    for user_id, user_idx in final_graph.user_mapping.items():
+        embedding = model.get_user_embedding(x, edge_index, user_idx)
+        user_embeddings.append(embedding)
+        user_ids.append(user_id)
+    
+    # Cluster embeddings
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+    clusters = kmeans.fit_predict(user_embeddings)
+    
+    # Create a scatter plot with clusters
+    reduced = PCA(n_components=2).fit_transform(user_embeddings)
+    
+    plt.figure(figsize=(12, 8))
+    for cluster_id in range(n_clusters):
+        cluster_points = reduced[clusters == cluster_id]
+        plt.scatter(
+            cluster_points[:, 0], 
+            cluster_points[:, 1], 
+            label=f'Cluster {cluster_id}',
+            alpha=0.7
+        )
+    
+    plt.title('User Embedding Clusters')
+    plt.xlabel('Dimension 1')
+    plt.ylabel('Dimension 2')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('user_clusters.png')
+    
+    return user_ids, clusters
+
+
+def create_preference_heatmap(model, graph_data_list, user_clusters, ratings_df):
+    """Generate a heatmap showing preference patterns by cluster"""
+    import seaborn as sns
+    
+    # Get most popular items from the original ratings DataFrame
+    item_counts = ratings_df['movieId'].value_counts().to_dict()
+    
+    # Get top 10 most popular items
+    top_items = sorted(item_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+    top_item_ids = [item[0] for item in top_items]
+    
+    # Create preference matrix for each cluster
+    user_ids, clusters = user_clusters  # Unpack the tuple
+    n_clusters = len(np.unique(clusters))
+    cluster_preferences = np.zeros((n_clusters, len(top_item_ids)))
+    
+    # Fill preference matrix using the original ratings DataFrame
+    for i, user_id in enumerate(user_ids):
+        cluster_id = clusters[i]
+        user_ratings = ratings_df[ratings_df['userId'] == user_id]
+        
+        for j, item_id in enumerate(top_item_ids):
+            # Look up user's rating for this item if available
+            item_ratings = user_ratings[user_ratings['movieId'] == item_id]
+            
+            if len(item_ratings) > 0:
+                # Average if there are multiple ratings
+                cluster_preferences[cluster_id, j] += item_ratings['rating'].mean()
+    
+    # Normalize by cluster size
+    for cluster_id in range(cluster_preferences.shape[0]):
+        cluster_size = np.sum(clusters == cluster_id)
+        if cluster_size > 0:
+            cluster_preferences[cluster_id, :] /= cluster_size
+    
+    # Create heatmap
+    plt.figure(figsize=(12, 8))
+    sns.heatmap(
+        cluster_preferences, 
+        annot=True, 
+        cmap='YlGnBu',
+        xticklabels=[f'Item {item_id}' for item_id in top_item_ids],
+        yticklabels=[f'Cluster {i}' for i in range(n_clusters)]
+    )
+    plt.title('Preference Patterns by User Cluster')
+    plt.tight_layout()
+    plt.savefig('cluster_preferences.png')
+
+
+def evaluate_model(model, test_graph_data, ratings_df):
+    """Evaluate model on test data and generate performance metrics"""
+    from sklearn.metrics import mean_squared_error, confusion_matrix, accuracy_score
+    
+    # Extract data
+    x = test_graph_data.x
+    edge_index = test_graph_data.edge_index
+    edge_attr = test_graph_data.edge_attr
+    
+    # Create test examples
+    user_indices = []
+    item_indices = []
+    ratings = []
+    
+    # Get original user and item IDs for reporting
+    user_id_mapping = test_graph_data.user_mapping
+    item_id_mapping = test_graph_data.item_mapping
+    
+    for i in range(0, edge_index.shape[1], 2):  # Skip item->user edges
+        user_idx = edge_index[0, i].item()
+        item_idx = edge_index[1, i].item() - test_graph_data.num_users
+        
+        # Skip if the item_idx is negative
+        if item_idx < 0:
+            continue
+            
+        rating = edge_attr[i].item()
+        
+        user_indices.append(user_idx)
+        item_indices.append(item_idx)
+        ratings.append(rating)
+    
+    user_indices = torch.tensor(user_indices, dtype=torch.long)
+    item_indices = torch.tensor(item_indices, dtype=torch.long)
+    
+    # Normalize ratings to [0,1] for the model
+    normalized_ratings = torch.tensor(ratings, dtype=torch.float) / 5.0
+    
+    # Make predictions
+    model.eval()
+    with torch.no_grad():
+        predictions = model(x, edge_index, user_indices, item_indices)
+    
+    # Convert back to original scale
+    predictions_numpy = predictions.numpy() * 5.0
+    true_ratings = normalized_ratings.numpy() * 5.0
+    
+    # Calculate RMSE
+    rmse = np.sqrt(mean_squared_error(true_ratings, predictions_numpy))
+    
+    # For confusion matrix, round predictions to nearest integer
+    rounded_preds = np.round(predictions_numpy).astype(int)
+    rounded_true = np.round(true_ratings).astype(int)
+    
+    # Ensure values are within rating range (1-5)
+    rounded_preds = np.clip(rounded_preds, 1, 5)
+    rounded_true = np.clip(rounded_true, 1, 5)
+    
+    # Calculate accuracy and confusion matrix
+    accuracy = accuracy_score(rounded_true, rounded_preds)
+    conf_matrix = confusion_matrix(rounded_true, rounded_preds, labels=range(1, 6))
+    
+    # Plot confusion matrix
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues',
+                xticklabels=range(1, 6), 
+                yticklabels=range(1, 6))
+    plt.title('Rating Prediction Confusion Matrix')
+    plt.xlabel('Predicted Rating')
+    plt.ylabel('True Rating')
+    plt.savefig('confusion_matrix.png')
+    
+    # Print metrics
+    print(f"RMSE: {rmse:.4f}")
+    print(f"Accuracy: {accuracy:.4f}")
+    
+    return rmse, accuracy, conf_matrix
+
 
 # Main function to run the entire pipeline
 def main():
@@ -472,11 +644,38 @@ def main():
     learning_rate = 0.001
     time_windows = 3
     
-    # Prepare data
-    graph_data_list = prepare_movielens_for_gnn(
-        file_path="ml-1m/ratings.dat", 
-        time_windows=time_windows
-    )
+    # Load the original ratings data
+    file_path = "ml-1m/ratings.dat"
+    if os.path.exists(file_path):
+        # Load the MovieLens 1M dataset
+        ratings_df = pd.read_csv(file_path, 
+                            sep='::', 
+                            header=None, 
+                            names=['userId', 'movieId', 'rating', 'timestamp'],
+                            engine='python')
+        
+        # Add human-readable dates
+        ratings_df['date'] = ratings_df['timestamp'].apply(lambda x: datetime.fromtimestamp(x).strftime('%Y-%m-%d'))
+        
+        # Convert ratings to float
+        ratings_df['rating'] = ratings_df['rating'].astype(float)
+    else:
+        print(f"File not found: {file_path}")
+        print("Using sample data instead...")
+        
+        # Create sample data
+        sample_ratings = [
+            {'userId': 1, 'movieId': 101, 'rating': 5.0, 'timestamp': 1000000000},
+            {'userId': 1, 'movieId': 102, 'rating': 3.0, 'timestamp': 1000100000},
+            # ... add all your sample data points here ...
+            {'userId': 3, 'movieId': 107, 'rating': 4.5, 'timestamp': 1005200000}
+        ]
+        
+        ratings_df = pd.DataFrame(sample_ratings)
+        ratings_df['date'] = ratings_df['timestamp'].apply(lambda x: datetime.fromtimestamp(x).strftime('%Y-%m-%d'))
+    
+    # Prepare data - create graph data list from ratings_df
+    graph_data_list = create_temporal_graph(ratings_df, time_windows=time_windows)
     
     if not graph_data_list:
         print("No data available. Exiting...")
@@ -523,6 +722,15 @@ def main():
         model=trained_model,
         graph_data_list=graph_data_list
     )
+
+    # Cluster users
+    user_ids, clusters = cluster_users(trained_model, graph_data_list)
+
+    # Create preference heatmap - passing ratings_df
+    create_preference_heatmap(trained_model, graph_data_list, (user_ids, clusters), ratings_df)
+
+    # Evaluate model performance - passing ratings_df
+    rmse, accuracy, conf_matrix = evaluate_model(trained_model, graph_data_list[-1], ratings_df)
     
     # Print users with most significant shifts
     print("\nUsers with the most significant preference shifts:")
